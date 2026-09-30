@@ -1,0 +1,17 @@
+LED SETUP
+# self-heal: install on-device bunnyctl if missing (idempotent; cheap after 1st boot)
+[ -x /usr/local/bunny/bin/bunnyctl ] || {
+    mkdir -p /usr/local/bunny/bin
+    cp /usr/local/bunny/udisk/bunnyctl.sh /usr/local/bunny/bin/bunnyctl 2>/dev/null
+    chmod +x /usr/local/bunny/bin/bunnyctl 2>/dev/null
+}
+# SW1 bank -> mode.txt
+PROFILE=$(cat /usr/local/bunny/udisk/mode.txt 2>/dev/null | head -1 | tr -d '[:space:]')
+[ -z "$PROFILE" ] && PROFILE="default"
+SCRIPT="/usr/local/bunny/udisk/profiles/${PROFILE}.sh"
+if [ -f "$SCRIPT" ]; then
+    . "$SCRIPT"
+else
+    ATTACKMODE HID STORAGE
+    LED FINISH
+fi

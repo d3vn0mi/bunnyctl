@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""
+bunnyctl v0.5 - Hak5 Bash Bunny serial control & audit
+======================================================
+Drives a Bash Bunny over its USB serial console (CDC-ACM) non-interactively:
+finds the port, wakes the line (DTR hangup toggle), logs in, and runs commands
+or canned workflows, returning clean output.
+
+Requires : Python 3.6+, pyserial   ->  python3 -m pip install --user pyserial
+Tested on: Bash Bunny Mark I (OpenSSH 6.7 / Debian 8), macOS + Linux hosts.
+
+Usage (options go AFTER the subcommand):
+  bunnyctl.py probe                          detect port, dump what the console returns
+  bunnyctl.py gpio                           read switch GPIOs (PA8/PL4/PL3)
+  bunnyctl.py exec "uname -a"                run one command, print its output
+  bunnyctl.py audit                          read-only inventory / security audit
+  bunnyctl.py setup-ssh --pubkey ~/.ssh/bunny.pub [--pubkey ~/.ssh/bunny_rsa.pub]
+  --- chameleon flow ---
+  bunnyctl.py modes                          list ATTACKMODE tokens for profile scripts
+  bunnyctl.py mode                           show current profile (mode.txt)
+  bunnyctl.py mode kbd1                      set SW1 (far) profile (no validation)
+  bunnyctl.py mode2 kbd2                     set SW2 (middle) profile (no validation)
+  bunnyctl.py status                         switch position + both bank profiles
+  bunnyctl.py hostid                         how the attached Bunny enumerates on THIS host
+  --- profile management ---
+  bunnyctl.py profiles                       list profiles on device
+  bunnyctl.py profile kbd1                   show a profile script
+  bunnyctl.py profile-push kbd1 myscript.sh  push a local script as a named profile
+  --- identifiers (keyboard or storage) ---
+  bunnyctl.py ids kbd1                        show class + VID/PID/MAN/PROD/SN
+  bunnyctl.py ids kbd1 --vid 0x413c --pid 0x2113 --man "Dell" --prod "KB216"
+  bunnyctl.py ids usb_sandisk --sn "1234ABCD"
+
+Common options: --port --baud --user --password --timeout --no-wake
+Port autodetects /dev/cu.usbmodem* (macOS) or /dev/ttyACM* (Linux) when --port omitted.
+
+Chameleon flow (this unit): arming = switch nearest USB (setup / serial / udisk).
+Two operational banks, each a dispatcher that reads its own mode file and sources
+the named profile:
+  switch1 = FAR end -> mode.txt   (self-installs on-device bunnyctl if missing)
+  switch2 = MIDDLE  -> mode2.txt
+Set a bank's profile in arming mode, flip to that switch, replug into the target.
+Both banks draw from the same profiles/ pool. macOS won't bind the Bunny's ECM
+ethernet, so SSH must originate from a Linux host.
+
+Profile scripts live at /usr/local/bunny/udisk/profiles/<name>.sh on the device.
+mode.txt / mode2.txt hold profile names; the matching dispatcher sources them.
+
+CHANGELOG
+  v0.1  initial consolidation (probe + gpio + exec + audit + setup-ssh)
+  v0.2  chameleon flow: modes / mode / status / hostid
+  v0.3  profile system: profiles / profile / profile-push; mode accepts profile names
+  v0.4  second payload bank: mode2 (SW2/mode2.txt); status shows both banks
+  v0.5  ids: view/edit ATTACKMODE identifiers (VID/PID/MAN/PROD/SN/class) per profile
+"""
+import sys, time, glob, random, argparse
+
+VERSION = "0.5"
+
+# mode.txt  -> SW1 (far end) active profile; switch1/payload.txt reads it at boot.
+# mode2.txt -> SW2 (middle)  active profile; switch2/payload.txt reads it at boot.
+MODE_PATH     = "/usr/local/bunny/udisk/mode.txt"
+MODE2_PATH    = "/usr/local/bunny/udisk/mode2.txt"
+PROFILES_PATH = "/usr/local/bunny/udisk/profiles"
+
+# Reference tokens for writing profile scripts (mouse NOT supported on stock fw).
+MODE_TOKENS = {
+    "HID": "keyboard",
+    "STORAGE": "mass storage",
+    "SERIAL": "serial console",
+    "ECM_ETHERNET": "network adapter (macOS/Linux)",
+    "RNDIS_ETHERNET": "network adapter (Windows)",
+    "AUTO_ETHERNET": "RNDIS with ECM fallback",
+}
+
+# Read-only audit checklist: (label, shell command)
+AUDIT = [
+    ("uname",        "uname -a"),
+    ("version",      "cat /version.txt 2>/dev/null; echo ---; ls /usr/local/bunny 2>/dev/null | tr '\\n' ' '"),
+    ("clock",        "date; cat /proc/uptime 2>/dev/null"),
+    ("payload_tree", "ls -laR /usr/local/bunny/udisk/payloads 2>/dev/null"),
+    ("payloads",     "for f in $(find /usr/local/bunny/udisk/payloads -name payload.txt 2>/dev/null); do echo \"# $f\"; cat \"$f\"; echo; done"),
+    ("loot",         "ls -laR /usr/local/bunny/udisk/loot 2>/dev/null | head -80"),
+    ("bigfiles",     "find /usr/local/bunny/udisk -type f -size +20k 2>/dev/null -exec ls -lh {} \\;"),
+    ("persist",      "cat /etc/rc.local 2>/dev/null; echo ---CRON---; crontab -l 2>/dev/null; ls -la /etc/cron* 2>/dev/null"),
+    ("sshkeys",      "ls -la /root/.ssh 2>/dev/null; echo ---AUTH---; cat /root/.ssh/authorized_keys 2>/dev/null"),
+    ("accounts",     "cat /etc/passwd"),
+    ("procs",        "ps w 2>/dev/null || ps 2>/dev/null"),
+    ("listen",       "netstat -tlnp 2>/dev/null || netstat -tln 2>/dev/null"),
+    ("gpio",         "for p in PA8 PL4 PL3; do printf '%s=' $p; cat /sys/class/gpio_sw/$p/data 2>/dev/null; done; echo"),
+    ("profiles",     "ls %s 2>/dev/null | sed 's/\\.sh$//' | sort" % PROFILES_PATH),
+    ("desc_ko",      "(strings /usr/local/bunny/lib/bunny_gadget.ko 2>/dev/null || tr -c '[:print:]' '\\n' < /usr/local/bunny/lib/bunny_gadget.ko) | grep -iE 'skylab|chicony|keyboard|manufacturer' | head"),
+    ("dmesg",        "dmesg 2>/dev/null | grep -iE 'gadget|switch|payload|g_ether|cdc|udc' | tail -20"),
+]
+
+
+def find_port():
+    for pat in ("/dev/cu.usbmodem*", "/dev/ttyACM*", "/dev/ttyUSB*", "/dev/tty.usbmodem*"):
+        m = sorted(glob.glob(pat))
+        if m:
+            return m[0]
+    return None
+
+
+class Bunny:
+    def __init__(self, port, baud=115200, user="root", password="hak5bunny", timeout=8, wake=True):
+        self.port, self.baud = port, baud
+        self.user, self.pw = user, password
+        self.timeout, self.wake = timeout, wake
+        self.ser = None
+
+    def open(self):
+        try:
+            import serial
+        except ImportError:
+            sys.exit("pyserial not installed. Run: python3 -m pip install --user pyserial")
+        self.ser = serial.Serial(self.port, self.baud, timeout=0.2)
+        if self.wake:
+            try:
+                self.ser.dtr = False; self.ser.rts = False; time.sleep(0.7)
+                self.ser.dtr = True;  self.ser.rts = True
+            except Exception:
+                pass
+            time.sleep(1.2)
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        return self
+
+    def _read_until(self, marker, timeout):
+        end = time.time() + timeout
+        buf = b""
+        mb = marker.encode() if marker else None
+        while time.time() < end:
+            c = self.ser.read(4096)
+            if c:
+                buf += c
+                if mb and mb in buf:
+                    break
+            else:
+                time.sleep(0.03)
+        return buf
+
+    def _send(self, s):
+        self.ser.write((s + "\r").encode())
+        self.ser.flush()
+
+    @staticmethod
+    def _mark(name="x"):
+        n = random.randint(1000, 9999)
+        return ("END_%s_%d" % (name, n), "EN''D_%s_%d" % (name, n))
+
+    def login(self):
+        self.ser.write(b"\x03\r"); self.ser.flush(); time.sleep(0.4)
+        pre = self._read_until(None, 2.0)
+        low = pre.lower()
+        if b"login:" in low:
+            self._send(self.user); self._read_until("assword", 3)
+            self._send(self.pw);   self._read_until("# ", 6)
+        elif b"assword" in low:
+            self._send(self.pw);   self._read_until("# ", 6)
+        return pre
+
+    def ready(self):
+        lit, typed = self._mark("RDY")
+        self._send("echo " + typed)
+        return lit.encode() in self._read_until(lit, 5)
+
+    def run(self, cmd, timeout=None):
+        lit, typed = self._mark()
+        self._send(cmd + " ; echo " + typed)
+        raw = self._read_until(lit, timeout or self.timeout).decode(errors="replace")
+        if typed in raw:
+            raw = raw.split(typed, 1)[1]
+        i = raw.rfind(lit)
+        if i != -1:
+            raw = raw[:i]
+        return raw.strip("\r\n")
+
+    def close(self):
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+
+
+def connect(args):
+    port = args.port or find_port()
+    if not port:
+        sys.exit("No serial port found - specify --port /dev/...")
+    b = Bunny(port, args.baud, args.user, args.password, args.timeout, not args.no_wake)
+    try:
+        b.open()
+    except Exception as e:
+        sys.exit("open failed on %s: %r" % (port, e))
+    return b, port
+
+
+def _ready_or_die(b, port):
+    b.login()
+    if not b.ready():
+        b.close()
+        sys.exit("shell not responding on %s (try replugging / --no-wake off)" % port)
+
+
+def cmd_probe(args):
+    b, port = connect(args)
+    b.ser.write(b"\x03\r"); b.ser.flush(); time.sleep(0.4)
+    out = b._read_until(None, 4)
+    print("port    :", port)
+    print("rx_bytes:", len(out))
+    print("tail    :", repr(out[-600:]))
+    b.close()
+
+
+def cmd_gpio(args):
+    b, port = connect(args); _ready_or_die(b, port)
+    print(b.run("for p in PA8 PL4 PL3; do printf '%s=' $p; cat /sys/class/gpio_sw/$p/data 2>/dev/null; done; echo"))
+    print("(PA8=switch1  PL4=switch2  PL3=switch3/arming ; value 0 = that position selected)")
+    b.close()
+
+
+def cmd_exec(args):
+    b, port = connect(args); _ready_or_die(b, port)
+    print(b.run(args.command, args.timeout))
+    b.close()
+
+
+def cmd_audit(args):
+    b, port = connect(args); _ready_or_die(b, port)
+    print("# bunnyctl v%s audit   port=%s\n" % (VERSION, port))
+    for name, c in AUDIT:
+        print("===== %s =====" % name)
+        print(b.run(c))
+        print()
+    b.close()
+
+
+def cmd_setup_ssh(args):
+    keys = []
+    for pf in (args.pubkey or []):
+        try:
+            with open(pf) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        keys.append(line)
+        except OSError as e:
+            sys.exit("cannot read %s: %r" % (pf, e))
+    if not keys:
+        sys.exit("provide at least one --pubkey FILE")
+    b, port = connect(args); _ready_or_die(b, port)
+    print(b.run("mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo MKOK"))
+    for k in keys:
+        body = k.split()[1] if len(k.split()) > 1 else k
+        print(b.run("grep -qF '%s' /root/.ssh/authorized_keys 2>/dev/null || echo '%s' >> /root/.ssh/authorized_keys; echo KEY_OK" % (body, k)))
+    print(b.run("chmod 600 /root/.ssh/authorized_keys; wc -l /root/.ssh/authorized_keys"))
+    ip = args.ip
+    ipaddr = ip.split("/")[0]
+    print(b.run("ip addr add %s dev eth0 2>/dev/null; ip link set eth0 up; ip -o addr show eth0" % ip))
+    print(b.run("grep -q %s /etc/rc.local 2>/dev/null || printf '#!/bin/sh -e\\nip addr add %s dev eth0 2>/dev/null || true\\nip link set eth0 up 2>/dev/null || true\\nexit 0\\n' > /etc/rc.local; chmod +x /etc/rc.local; cat /etc/rc.local" % (ipaddr, ip)))
+    print(b.run("grep -iE '^(PermitRootLogin|PubkeyAuthentication)' /etc/ssh/sshd_config"))
+    print("\nDone. From a Linux host on the gadget net:  ssh root@%s" % ipaddr)
+    b.close()
+
+
+# ---- chameleon flow (v0.2+) --------------------------------------------------
+
+def cmd_modes(args):
+    print("ATTACKMODE tokens for use in profile scripts (mouse NOT supported on stock fw):")
+    for k, d in MODE_TOKENS.items():
+        print("  %-15s %s" % (k, d))
+    print()
+    print("Combine tokens on one ATTACKMODE line, e.g.:")
+    print("  ATTACKMODE HID STORAGE")
+    print("  ATTACKMODE STORAGE VID_0x0781 PID_0x5567 MAN_\"SanDisk\" PROD_\"Cruzer Blade\"")
+    print()
+    print("Profile names (set with 'bunnyctl mode <name>'):")
+    print("  default       HID STORAGE, no keystrokes")
+    print("  kbd1          HID, runs payload#1 QUACK sequence")
+    print("  kbd2          HID, runs payload#2 QUACK sequence")
+    print("  usb_sandisk   STORAGE only, enumerates as SanDisk Cruzer Blade")
+    print()
+    print("Use 'bunnyctl profiles' to list profiles actually on the device.")
+
+
+def _mode_io(args, path, bank_label, switch_hint):
+    """Shared get/set for a bank's mode file (no token validation - value is a profile name)."""
+    value = " ".join(args.value).strip() if args.value else None
+    b, port = connect(args); _ready_or_die(b, port)
+    if value is None:
+        cur = b.run("cat %s 2>/dev/null" % path).strip()
+        b.close()
+        print("%s profile: %s" % (bank_label, cur if cur else "(empty -> default)"))
+        return
+    b.run("printf '%%s\\n' '%s' > %s" % (value, path))
+    back = b.run("cat %s 2>/dev/null" % path).strip()
+    b.close()
+    if back == value:
+        print("%s profile set -> %s   (flip to %s and replug to use it)" % (bank_label, back, switch_hint))
+    else:
+        print("WARNING: wrote '%s' but device reads '%s'" % (value, back))
+
+
+def cmd_mode(args):
+    """SW1 (far end) profile in mode.txt."""
+    _mode_io(args, MODE_PATH, "SW1", "switch1 / FAR end")
+
+
+def cmd_mode2(args):
+    """SW2 (middle) profile in mode2.txt."""
+    _mode_io(args, MODE2_PATH, "SW2", "switch2 / MIDDLE")
+
+
+def cmd_status(args):
+    import re
+    b, port = connect(args); _ready_or_die(b, port)
+    gpio    = b.run("for p in PA8 PL4 PL3; do printf '%s=' $p; cat /sys/class/gpio_sw/$p/data 2>/dev/null; done")
+    mode    = b.run("cat %s 2>/dev/null" % MODE_PATH).strip()
+    mode2   = b.run("cat %s 2>/dev/null" % MODE2_PATH).strip()
+    profile = ""
+    if mode:
+        profile = b.run("cat %s/%s.sh 2>/dev/null || echo PROFILE_NOT_FOUND" % (PROFILES_PATH, mode)).strip()
+    profile2 = ""
+    if mode2:
+        profile2 = b.run("cat %s/%s.sh 2>/dev/null || echo PROFILE_NOT_FOUND" % (PROFILES_PATH, mode2)).strip()
+    b.close()
+
+    def g(k):
+        mm = re.search(k + r"=\s*([01])", gpio)
+        return mm.group(1) if mm else "?"
+    pa8, pl4, pl3 = g("PA8"), g("PL4"), g("PL3")
+    if pa8 == "0":
+        pos = "switch1  (FAR end)   -> chameleon"
+    elif pl4 == "0":
+        pos = "switch2  (MIDDLE)    -> fallback"
+    elif pl3 == "0":
+        pos = "arming   (USB side)  -> setup / serial"
+    else:
+        pos = "unknown (no line reads 0)"
+    print("port          : %s" % port)
+    print("switch now    : %s" % pos)
+    print("gpio          : PA8=%s PL4=%s PL3=%s" % (pa8, pl4, pl3))
+    print("switch1 (far) : profile = %s" % (mode if mode else "(empty -> default)"))
+    if profile and "PROFILE_NOT_FOUND" not in profile:
+        print("  profile script:")
+        for line in profile.splitlines():
+            print("    %s" % line)
+    elif mode:
+        print("  WARNING: profile '%s' not found on device (run: bunnyctl profiles)" % mode)
+    print("switch2 (mid) : profile = %s" % (mode2 if mode2 else "(empty -> default)"))
+    if profile2 and "PROFILE_NOT_FOUND" not in profile2:
+        print("  profile script:")
+        for line in profile2.splitlines():
+            print("    %s" % line)
+    elif mode2:
+        print("  WARNING: profile '%s' not found on device (run: bunnyctl profiles)" % mode2)
+
+
+def cmd_hostid(args):
+    import subprocess, platform
+    s = platform.system()
+    try:
+        if s == "Darwin":
+            out = subprocess.check_output(["system_profiler", "SPUSBDataType"], text=True, stderr=subprocess.DEVNULL)
+        elif s == "Linux":
+            out = subprocess.check_output(["lsusb", "-v"], text=True, stderr=subprocess.DEVNULL)
+        else:
+            print("hostid: unsupported host OS: %s" % s); return
+    except Exception as e:
+        print("hostid failed (%r) - is the tool available on PATH?" % e); return
+    lines = out.splitlines()
+    keys = ("f000", "skylab", "gadget serial", "chicony")
+    hits = [i for i, l in enumerate(lines) if any(k in l.lower() for k in keys)]
+    if not hits:
+        print("No Bash Bunny (VID f000 / Skylab) visible on this host's USB right now.")
+        return
+    lo, hi = max(0, hits[0] - 8), min(len(lines), hits[-1] + 4)
+    print("\n".join(l.rstrip() for l in lines[lo:hi]))
+
+
+# ---- profile management (v0.3) -----------------------------------------------
+
+def cmd_profiles(args):
+    b, port = connect(args); _ready_or_die(b, port)
+    out = b.run("ls %s 2>/dev/null | sed 's/\\.sh$//' | sort" % PROFILES_PATH)
+    b.close()
+    if out.strip():
+        print("profiles on device:")
+        for p in out.strip().splitlines():
+            print("  %s" % p.strip())
+    else:
+        print("no profiles found at %s" % PROFILES_PATH)
+
+
+def cmd_profile(args):
+    b, port = connect(args); _ready_or_die(b, port)
+    out = b.run("cat %s/%s.sh 2>/dev/null || echo __NOT_FOUND__" % (PROFILES_PATH, args.name))
+    b.close()
+    if "__NOT_FOUND__" in out:
+        sys.exit("profile not found: %s   (run: bunnyctl profiles)" % args.name)
+    print(out)
+
+
+def cmd_profile_push(args):
+    import base64
+    if args.file:
+        try:
+            with open(args.file, "rb") as f:
+                content = f.read()
+        except OSError as e:
+            sys.exit("cannot read %s: %r" % (args.file, e))
+    else:
+        content = sys.stdin.buffer.read()
+    b64 = base64.b64encode(content).decode()
+    b, port = connect(args); _ready_or_die(b, port)
+    b.run("mkdir -p %s" % PROFILES_PATH)
+    dest = "%s/%s.sh" % (PROFILES_PATH, args.name)
+    b.run("printf '%%s' '%s' | base64 -d > %s" % (b64, dest))
+    b.run("chmod +x %s" % dest)
+    size = b.run("wc -c < %s 2>/dev/null" % dest).strip()
+    b.close()
+    print("pushed '%s' -> %s  (%s bytes on device)" % (args.name, dest, size))
+
+
+# ---- identifier editing (v0.5) -----------------------------------------------
+# Edits the ATTACKMODE line of a profile in place. Works for any class (HID,
+# STORAGE, ...) since USB descriptor overrides live on that one line.
+
+OVERRIDE_KEYS = ("VID", "PID", "MAN", "PROD", "SN")
+QUOTED_KEYS   = ("MAN", "PROD", "SN")   # string descriptors get quoted
+
+
+def _parse_attackmode(line):
+    """(indent, modes[list], overrides{dict}) from an ATTACKMODE line."""
+    import shlex
+    indent = line[:len(line) - len(line.lstrip())]
+    toks = shlex.split(line.strip())          # strips the KEY_"a b" quoting for us
+    modes, ov = [], {}
+    for t in toks[1:]:                         # toks[0] == "ATTACKMODE"
+        for k in OVERRIDE_KEYS:
+            if t.startswith(k + "_"):
+                ov[k] = t[len(k) + 1:]
+                break
+        else:
+            modes.append(t)
+    return indent, modes, ov
+
+
+def _build_attackmode(indent, modes, ov):
+    parts = ["ATTACKMODE"] + modes
+    for k in OVERRIDE_KEYS:
+        v = ov.get(k)
+        if v:
+            parts.append('%s_"%s"' % (k, v) if k in QUOTED_KEYS else "%s_%s" % (k, v))
+    return indent + " ".join(parts)
+
+
+def cmd_ids(args):
+    import base64
+    b, port = connect(args); _ready_or_die(b, port)
+    path = "%s/%s.sh" % (PROFILES_PATH, args.name)
+    text = b.run("cat %s 2>/dev/null || echo __NOT_FOUND__" % path)
+    if "__NOT_FOUND__" in text:
+        b.close(); sys.exit("profile not found: %s   (run: bunnyctl profiles)" % args.name)
+    lines = text.splitlines()
+    idx = next((i for i, l in enumerate(lines) if l.strip().startswith("ATTACKMODE")), None)
+    if idx is None:
+        b.close(); sys.exit("no ATTACKMODE line in profile '%s'" % args.name)
+    indent, modes, ov = _parse_attackmode(lines[idx])
+
+    overrides = {"VID": args.vid, "PID": args.pid, "MAN": args.man, "PROD": args.prod, "SN": args.sn}
+    changing = args.mode is not None or any(v is not None for v in overrides.values())
+    if not changing:
+        b.close()
+        print("profile : %s" % args.name)
+        print("class   : %s" % (" ".join(modes) if modes else "(none)"))
+        for k in OVERRIDE_KEYS:
+            print("%-7s : %s" % (k, ov.get(k, "(default)")))
+        return
+
+    if args.mode is not None:
+        modes = args.mode.split()
+    for k, v in overrides.items():
+        if v is not None:
+            ov[k] = v
+    old_line = lines[idx]
+    new_line = _build_attackmode(indent, modes, ov)
+    lines[idx] = new_line
+    new_text = "\n".join(lines) + "\n"
+    b64 = base64.b64encode(new_text.encode()).decode()
+    b.run("printf '%%s' '%s' | base64 -d > %s" % (b64, path))
+    b.run("chmod +x %s" % path)
+    b.close()
+    print("profile : %s" % args.name)
+    print("- %s" % old_line.strip())
+    print("+ %s" % new_line.strip())
+    print("(flip to the matching switch and replug to use it)")
+
+
+# ---- arg parser + dispatch ---------------------------------------------------
+
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--port",     help="serial device (default: autodetect)")
+    common.add_argument("--baud",     type=int, default=115200)
+    common.add_argument("--user",     default="root")
+    common.add_argument("--password", default="hak5bunny")
+    common.add_argument("--timeout",  type=int, default=8, help="per-command read timeout (s)")
+    common.add_argument("--no-wake",  action="store_true", help="skip the DTR hangup toggle")
+
+    p = argparse.ArgumentParser(prog="bunnyctl", description="Bash Bunny serial control & audit (v%s)" % VERSION)
+    p.add_argument("--version", action="version", version="bunnyctl " + VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("probe",    parents=[common], help="detect port and dump console output")
+    sub.add_parser("gpio",     parents=[common], help="read switch-position GPIOs")
+    sub.add_parser("audit",    parents=[common], help="read-only inventory/security audit")
+
+    pe = sub.add_parser("exec", parents=[common], help="run one shell command on the Bunny")
+    pe.add_argument("command")
+
+    ps = sub.add_parser("setup-ssh", parents=[common], help="install pubkeys + eth0 up/persist")
+    ps.add_argument("--pubkey", action="append", help="public key file (repeatable)")
+    ps.add_argument("--ip", default="172.16.64.1/24", help="eth0 CIDR on the Bunny")
+
+    sub.add_parser("modes",   help="list ATTACKMODE tokens + built-in profiles (no device needed)")
+
+    pm = sub.add_parser("mode", parents=[common], help="get/set SW1 (far) profile in mode.txt")
+    pm.add_argument("value", nargs="*", help="profile name (e.g. kbd1); omit to read current")
+
+    pm2 = sub.add_parser("mode2", parents=[common], help="get/set SW2 (middle) profile in mode2.txt")
+    pm2.add_argument("value", nargs="*", help="profile name (e.g. kbd2); omit to read current")
+
+    sub.add_parser("status",  parents=[common], help="switch position + both bank profiles")
+    sub.add_parser("hostid",  help="how the attached Bunny enumerates on THIS host (no serial)")
+
+    sub.add_parser("profiles", parents=[common], help="list profiles on device")
+
+    pp = sub.add_parser("profile", parents=[common], help="show a profile script from device")
+    pp.add_argument("name", help="profile name (without .sh extension)")
+
+    ppush = sub.add_parser("profile-push", parents=[common],
+                           help="push a local script as a named profile on device")
+    ppush.add_argument("name", help="profile name (without .sh)")
+    ppush.add_argument("file", nargs="?", help="local .sh file to push (default: stdin)")
+
+    pids = sub.add_parser("ids", parents=[common],
+                          help="view/edit ATTACKMODE identifiers of a profile")
+    pids.add_argument("name", help="profile name (without .sh)")
+    pids.add_argument("--vid",  help="USB vendor id, e.g. 0x0781")
+    pids.add_argument("--pid",  help="USB product id, e.g. 0x5567")
+    pids.add_argument("--man",  help="iManufacturer string")
+    pids.add_argument("--prod", help="iProduct string")
+    pids.add_argument("--sn",   help="iSerial string")
+    pids.add_argument("--mode", help="class token(s), e.g. 'HID' or 'HID STORAGE'")
+
+    a = p.parse_args()
+    dispatch = {
+        "probe":        cmd_probe,
+        "gpio":         cmd_gpio,
+        "audit":        cmd_audit,
+        "exec":         cmd_exec,
+        "setup-ssh":    cmd_setup_ssh,
+        "modes":        cmd_modes,
+        "mode":         cmd_mode,
+        "mode2":        cmd_mode2,
+        "status":       cmd_status,
+        "hostid":       cmd_hostid,
+        "profiles":     cmd_profiles,
+        "profile":      cmd_profile,
+        "profile-push": cmd_profile_push,
+        "ids":          cmd_ids,
+    }
+    dispatch[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
