@@ -149,46 +149,77 @@ python3 bunnyctl.py profile-push kbd1 kbd1.sh # push
 
 ## Changing USB identifiers (VID / PID / SN / strings)
 
-Every USB descriptor override lives on the profile's **`ATTACKMODE` line**, and
-this works for **both** a keyboard (`HID`) and a mass-storage (`STORAGE`)
-personality — same syntax, same tokens:
+> **Read this first — stock firmware reality (Mark I).** The Bash Bunny's
+> `ATTACKMODE` does **not** treat all descriptor fields equally. It only wires
+> `idVendor` / `idProduct` / `iManufacturer` / `iSerialNumber` from its args, it
+> has **no `PROD_` handling at all**, and it **uppercases every argument**. So a
+> naive `MAN_"SanDisk" PROD_"Cruzer Blade"` yields manufacturer `SANDISK` and
+> the *default* product string (`HP Skylab USB Keyboard`) — a dead giveaway.
+> This tool ships an ATTACKMODE patch (`patch_attackmode.sh`) that adds
+> case/space-preserving `iProduct` + `iManufacturer` via env vars. Apply it once
+> per device (see below); the SW1/SW2 dispatchers don't need it, only the string
+> spoofs do.
 
+Split by how each field is actually applied:
+
+| Field | Descriptor | How it's set | Notes |
+|-------|-----------|--------------|-------|
+| VID | idVendor | `VID_0x####` on `ATTACKMODE` line | works stock |
+| PID | idProduct | `PID_0x####` on `ATTACKMODE` line | works stock |
+| SN | iSerialNumber | `SN_"..."` on `ATTACKMODE` line | works stock |
+| MAN | iManufacturer | `export BUNNY_IMANUFACTURER="..."` before `ATTACKMODE` | env — preserves case/spaces (needs patch) |
+| PROD | iProduct | `export BUNNY_IPRODUCT="..."` before `ATTACKMODE` | env — stock has no `PROD_` at all (needs patch) |
+
+**Apply the ATTACKMODE patch once per device:**
+
+```sh
+python3 bunnyctl.py push patch_attackmode.sh /usr/local/bunny/udisk/patch_attackmode.sh
+python3 bunnyctl.py exec 'sh /usr/local/bunny/udisk/patch_attackmode.sh'
 ```
-ATTACKMODE <class...> VID_0x#### PID_0x#### MAN_"<mfr>" PROD_"<product>" SN_"<serial>"
+
+It backs up the original to `ATTACKMODE.orig`, is idempotent, and rebuilds from
+that backup each run (so it also repairs an earlier attempt). A **firmware
+upgrade wipes it** — just re-run.
+
+**Manual profile form** (what `usb_sandisk.sh` looks like):
+
+```sh
+export BUNNY_IMANUFACTURER="SanDisk"
+export BUNNY_IPRODUCT="Cruzer Blade"
+ATTACKMODE STORAGE VID_0x0781 PID_0x5567 SN_"4C530112050213104539"
+LED FINISH
 ```
 
-| Token   | USB descriptor        | Example              |
-|---------|-----------------------|----------------------|
-| `VID_`  | idVendor              | `VID_0x0781`         |
-| `PID_`  | idProduct             | `PID_0x5567`         |
-| `MAN_`  | iManufacturer string  | `MAN_"SanDisk"`      |
-| `PROD_` | iProduct string       | `PROD_"Cruzer Blade"`|
-| `SN_`   | iSerial string        | `SN_"4C5300123..."`  |
+Keyboard impersonation is identical — set the class to `HID`:
 
-**Manually:** edit the `ATTACKMODE` line in `profiles/<name>.sh`.
+```sh
+export BUNNY_IMANUFACTURER="Dell"
+export BUNNY_IPRODUCT="KB216 Wired Keyboard"
+ATTACKMODE HID VID_0x413c PID_0x2113
+```
 
-- **Spoof a specific flash drive (storage):**
-  ```sh
-  ATTACKMODE STORAGE VID_0x0781 PID_0x5567 MAN_"SanDisk" PROD_"Cruzer Blade" SN_"4C530001071112116351"
-  ```
-- **Impersonate a specific keyboard (HID):**
-  ```sh
-  ATTACKMODE HID VID_0x413c PID_0x2113 MAN_"Dell" PROD_"KB216 Wired Keyboard"
-  ```
-  (`0x413c` = Dell, `0x2113` = KB216. Match a keyboard the target org actually
-  deploys to blend into endpoint inventories.)
+(`0x413c` = Dell, `0x2113` = KB216. Match a keyboard the target org actually
+deploys to blend into endpoint inventories.)
 
-**Where to source real IDs:** pull VID/PID from the USB-IF database, `lsusb` on a
-reference device, or the Windows registry (`HKLM\SYSTEM\CurrentControlSet\Enum\USB`)
-on a target-representative host. `SN_` is free-form — for storage, cloning a real
+**Where to source real IDs:** USB-IF database, `lsusb` on a reference device, or
+the Windows registry (`HKLM\SYSTEM\CurrentControlSet\Enum\USB`) on a
+target-representative host. `SN_` is free-form — for storage, cloning a real
 unit's serial defeats naive allowlists keyed on serial.
 
-**With the tool** (see next section) — no hand-editing:
+**With the tool** — no hand-editing (VID/PID/SN edit the `ATTACKMODE` line;
+MAN/PROD upsert the `BUNNY_*` env exports):
 
 ```sh
 python3 bunnyctl.py ids usb_sandisk --sn "4C530001071112116351"
 python3 bunnyctl.py ids kbd1 --vid 0x413c --pid 0x2113 --man "Dell" --prod "KB216 Wired Keyboard"
+python3 bunnyctl.py ids usb_sandisk          # show current: VID/PID/SN + MAN/PROD (env)
 ```
+
+> **Verify from the host, not serial.** In a STORAGE-only spoof there's no serial
+> console, so confirm on the target:
+> `ioreg -p IOUSB -l -w0 | grep -iA5 -e SanDisk -e Cruzer` (macOS) or check
+> Windows "Devices and Printers". macOS caches string descriptors per
+> `(VID,PID)`/port — if a value looks stale, replug into a **different port**.
 
 ---
 
@@ -212,11 +243,13 @@ Options go **after** the subcommand. Port autodetects `/dev/cu.usbmodem*`
 | `profiles`                           | list profiles on device                              |
 | `profile <name>`                     | print a profile script from device                   |
 | `profile-push <name> <file>`         | push a local `.sh` as a named profile                |
-| `ids <name> [--vid --pid --man --prod --sn --mode]` | view / edit a profile's ATTACKMODE identifiers |
+| `ids <name> [--vid --pid --sn --mode --man --prod]` | view / edit a profile's identifiers |
 
-`ids` with no flags prints the parsed class + descriptors. With flags it rewrites
-only the `ATTACKMODE` line in place (QUACK/LED lines untouched) and shows a diff.
-`--mode` replaces the class token(s), e.g. `--mode "HID STORAGE"`.
+`ids` with no flags prints class + VID/PID/SN (from the `ATTACKMODE` line) and
+MAN/PROD (from `BUNNY_*` env exports). With flags: `--vid/--pid/--sn/--mode` edit
+the `ATTACKMODE` line; `--man/--prod` upsert the env exports (needs
+`patch_attackmode.sh` applied). QUACK/LED lines are never touched; a diff is
+shown. `--mode` replaces the class token(s), e.g. `--mode "HID STORAGE"`.
 
 Common options: `--port --baud --user --password --timeout --no-wake`.
 
@@ -326,11 +359,36 @@ The target hadn't finished enumerating the HID before the profile started
 typing. Increase the leading `QUACK DELAY` (2000–3000 ms; more for VDI/locked
 endpoints).
 
+### Storage/keyboard spoof: device doesn't enumerate at all (nothing appears)
+The gadget `insmod` failed, so no USB device comes up. On this firmware the
+usual cause is a **space in a string value reaching the kernel unquoted**: e.g.
+`iProduct="Cruzer Blade"` — the shell strips the quotes before `insmod`, the
+kernel module parser then splits on the space, treats `Blade` as an unknown
+parameter, and the load fails. The `patch_attackmode.sh` patch fixes this by
+single-quote-wrapping the value so the quotes survive to the kernel
+(`iProduct='"Cruzer Blade"'` → argv keeps `iProduct="Cruzer Blade"`). If you
+hand-roll module params, do the same. Confirm the patch is applied:
+`python3 bunnyctl.py exec 'grep -c BUNNY_ /usr/local/bunny/bin/ATTACKMODE'`
+(expect `2`). Revert with `ATTACKMODE.orig` if needed.
+
+### Manufacturer shows UPPERCASE, product shows "HP Skylab USB Keyboard"
+Stock `ATTACKMODE` uppercases args (`MAN_"SanDisk"` → `SANDISK`) and has no
+`PROD_` handling at all, so the product stays the firmware default. Set both via
+the `BUNNY_*` env exports (what `ids --man/--prod` writes) with the patch applied
+— see **Changing USB identifiers**. Re-check with `bunnyctl.py ids <name>`.
+
 ### Spoofed VID/PID/SN not taking effect
 `ids` edits only the first `ATTACKMODE` line. Confirm the profile has exactly one
-`ATTACKMODE` line and re-check with `python3 bunnyctl.py ids <name>`. Some hosts
-cache USB descriptors per port — try a different port or clear the target's USB
-enumeration cache. Quote strings with spaces (`--prod "Cruzer Blade"`).
+`ATTACKMODE` line and re-check with `python3 bunnyctl.py ids <name>`. macOS caches
+USB descriptors per `(VID,PID)`/port — try a different port or clear the target's
+USB enumeration cache.
+
+### Spoofed storage volume is a tell (label / contents)
+`ATTACKMODE STORAGE` exposes the **udisk** itself, so the volume mounts labelled
+`BashBunny` and shows `payloads/`, `tools/`, `profiles/`. Descriptors can be
+perfect and the mounted drive still gives it away. A clean separate backing image
+is on the roadmap (`ROADMAP.md`); until then, relabel the udisk and be aware
+anyone browsing the volume sees Bunny files.
 
 ### `profile '<name>' not found on device`
 The mode file names a profile with no matching `profiles/<name>.sh`. Run

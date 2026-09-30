@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bunnyctl v0.5 - Hak5 Bash Bunny serial control & audit
+bunnyctl v0.7 - Hak5 Bash Bunny serial control & audit
 ======================================================
 Drives a Bash Bunny over its USB serial console (CDC-ACM) non-interactively:
 finds the port, wakes the line (DTR hangup toggle), logs in, and runs commands
@@ -26,10 +26,13 @@ Usage (options go AFTER the subcommand):
   bunnyctl.py profiles                       list profiles on device
   bunnyctl.py profile kbd1                   show a profile script
   bunnyctl.py profile-push kbd1 myscript.sh  push a local script as a named profile
+  bunnyctl.py push local.sh /path/on/dev --chmod   push any file to the device (chunked)
   --- identifiers (keyboard or storage) ---
-  bunnyctl.py ids kbd1                        show class + VID/PID/MAN/PROD/SN
-  bunnyctl.py ids kbd1 --vid 0x413c --pid 0x2113 --man "Dell" --prod "KB216"
+  bunnyctl.py ids kbd1                        show class + VID/PID/SN (line) + MAN/PROD (env)
+  bunnyctl.py ids kbd1 --vid 0x413c --pid 0x2113 --man "Dell" --prod "KB216 Wired Keyboard"
   bunnyctl.py ids usb_sandisk --sn "1234ABCD"
+      (VID/PID/SN edit the ATTACKMODE line; MAN/PROD edit BUNNY_* env exports -
+       needs patch_attackmode.sh applied on the device)
 
 Common options: --port --baud --user --password --timeout --no-wake
 Port autodetects /dev/cu.usbmodem* (macOS) or /dev/ttyACM* (Linux) when --port omitted.
@@ -52,10 +55,15 @@ CHANGELOG
   v0.3  profile system: profiles / profile / profile-push; mode accepts profile names
   v0.4  second payload bank: mode2 (SW2/mode2.txt); status shows both banks
   v0.5  ids: view/edit ATTACKMODE identifiers (VID/PID/MAN/PROD/SN/class) per profile
+  v0.6  chunked base64 push (put_file) - fixes tty MAX_CANON mangling on big files;
+        new 'push' command; profile-push now chunked + syncs
+  v0.7  ids: MAN/PROD now driven via BUNNY_* env exports (stock ATTACKMODE has no
+        PROD_ and uppercases MAN_); VID/PID/SN stay on the ATTACKMODE line.
+        Requires the ATTACKMODE env patch (patch_attackmode.sh) on the device.
 """
 import sys, time, glob, random, argparse
 
-VERSION = "0.5"
+VERSION = "0.7"
 
 # mode.txt  -> SW1 (far end) active profile; switch1/payload.txt reads it at boot.
 # mode2.txt -> SW2 (middle)  active profile; switch2/payload.txt reads it at boot.
@@ -177,6 +185,25 @@ class Bunny:
         if i != -1:
             raw = raw[:i]
         return raw.strip("\r\n")
+
+    def put_file(self, dest, data, chunk=180, make_exec=False):
+        """Write bytes to dest on the device via chunked base64 append.
+        Each serial line stays < ~255 chars to respect the tty canonical-mode
+        line limit (MAX_CANON) - long single-line writes get mangled otherwise."""
+        import base64
+        b64 = base64.b64encode(data).decode()
+        tmp = "/tmp/.bctl_push.b64"
+        self.run(": > %s" % tmp)
+        for i in range(0, len(b64), chunk):
+            self.run("printf %%s %s >> %s" % (b64[i:i+chunk], tmp))
+        self.run("base64 -d %s > %s" % (tmp, dest))
+        self.run("rm -f %s" % tmp)
+        if make_exec:
+            self.run("chmod +x %s" % dest)
+        try:
+            return int(self.run("wc -c < %s 2>/dev/null" % dest).strip() or "0")
+        except ValueError:
+            return -1
 
     def close(self):
         try:
@@ -404,7 +431,6 @@ def cmd_profile(args):
 
 
 def cmd_profile_push(args):
-    import base64
     if args.file:
         try:
             with open(args.file, "rb") as f:
@@ -413,33 +439,52 @@ def cmd_profile_push(args):
             sys.exit("cannot read %s: %r" % (args.file, e))
     else:
         content = sys.stdin.buffer.read()
-    b64 = base64.b64encode(content).decode()
     b, port = connect(args); _ready_or_die(b, port)
     b.run("mkdir -p %s" % PROFILES_PATH)
     dest = "%s/%s.sh" % (PROFILES_PATH, args.name)
-    b.run("printf '%%s' '%s' | base64 -d > %s" % (b64, dest))
-    b.run("chmod +x %s" % dest)
-    size = b.run("wc -c < %s 2>/dev/null" % dest).strip()
+    size = b.put_file(dest, content, make_exec=True)
+    b.run("sync")
     b.close()
     print("pushed '%s' -> %s  (%s bytes on device)" % (args.name, dest, size))
 
 
-# ---- identifier editing (v0.5) -----------------------------------------------
-# Edits the ATTACKMODE line of a profile in place. Works for any class (HID,
-# STORAGE, ...) since USB descriptor overrides live on that one line.
+def cmd_push(args):
+    """Push an arbitrary local file to an absolute path on the device (chunked)."""
+    try:
+        with open(args.file, "rb") as f:
+            content = f.read()
+    except OSError as e:
+        sys.exit("cannot read %s: %r" % (args.file, e))
+    b, port = connect(args); _ready_or_die(b, port)
+    parent = args.dest.rsplit("/", 1)[0]
+    if parent and parent != args.dest:
+        b.run("mkdir -p %s" % parent)
+    size = b.put_file(args.dest, content, make_exec=args.chmod)
+    b.run("sync")
+    b.close()
+    print("pushed %s -> %s  (%s bytes on device%s)" %
+          (args.file, args.dest, size, ", +x" if args.chmod else ""))
 
-OVERRIDE_KEYS = ("VID", "PID", "MAN", "PROD", "SN")
-QUOTED_KEYS   = ("MAN", "PROD", "SN")   # string descriptors get quoted
+
+# ---- identifier editing (v0.7) -----------------------------------------------
+# VID/PID/SN live on the ATTACKMODE line (stock firmware honors them there).
+# MAN/PROD must go through env vars (BUNNY_IMANUFACTURER / BUNNY_IPRODUCT):
+# stock ATTACKMODE has NO PROD_ handling and uppercases MAN_, and the env path
+# (via the patch_attackmode.sh patch) preserves exact case and embedded spaces.
+
+ATK_KEYS = ("VID", "PID", "SN")          # honored as ATTACKMODE args
+ENV_KEYS = {"MAN": "BUNNY_IMANUFACTURER", "PROD": "BUNNY_IPRODUCT"}
 
 
 def _parse_attackmode(line):
-    """(indent, modes[list], overrides{dict}) from an ATTACKMODE line."""
+    """(indent, modes[list], overrides{dict}) from an ATTACKMODE line.
+    Collects VID/PID/SN plus any legacy MAN/PROD args still present."""
     import shlex
     indent = line[:len(line) - len(line.lstrip())]
-    toks = shlex.split(line.strip())          # strips the KEY_"a b" quoting for us
+    toks = shlex.split(line.strip())          # strips KEY_"a b" quoting for us
     modes, ov = [], {}
     for t in toks[1:]:                         # toks[0] == "ATTACKMODE"
-        for k in OVERRIDE_KEYS:
+        for k in ("VID", "PID", "SN", "MAN", "PROD"):
             if t.startswith(k + "_"):
                 ov[k] = t[len(k) + 1:]
                 break
@@ -449,16 +494,28 @@ def _parse_attackmode(line):
 
 
 def _build_attackmode(indent, modes, ov):
+    """Rebuild an ATTACKMODE line. Only VID/PID/SN go here; MAN/PROD are env."""
     parts = ["ATTACKMODE"] + modes
-    for k in OVERRIDE_KEYS:
+    for k in ATK_KEYS:
         v = ov.get(k)
         if v:
-            parts.append('%s_"%s"' % (k, v) if k in QUOTED_KEYS else "%s_%s" % (k, v))
+            parts.append('%s_"%s"' % (k, v) if k == "SN" else "%s_%s" % (k, v))
     return indent + " ".join(parts)
 
 
+def _parse_env(lines):
+    """Current BUNNY_IPRODUCT / BUNNY_IMANUFACTURER values from export lines."""
+    import re
+    env = {}
+    for l in lines:
+        m = re.match(r'\s*export\s+(BUNNY_IPRODUCT|BUNNY_IMANUFACTURER)=(.*)$', l)
+        if m:
+            env[m.group(1)] = m.group(2).strip().strip('"')
+    return env
+
+
 def cmd_ids(args):
-    import base64
+    import re
     b, port = connect(args); _ready_or_die(b, port)
     path = "%s/%s.sh" % (PROFILES_PATH, args.name)
     text = b.run("cat %s 2>/dev/null || echo __NOT_FOUND__" % path)
@@ -469,33 +526,60 @@ def cmd_ids(args):
     if idx is None:
         b.close(); sys.exit("no ATTACKMODE line in profile '%s'" % args.name)
     indent, modes, ov = _parse_attackmode(lines[idx])
+    env = _parse_env(lines)
+    cur_man  = env.get("BUNNY_IMANUFACTURER", ov.get("MAN", ""))
+    cur_prod = env.get("BUNNY_IPRODUCT",      ov.get("PROD", ""))
 
-    overrides = {"VID": args.vid, "PID": args.pid, "MAN": args.man, "PROD": args.prod, "SN": args.sn}
-    changing = args.mode is not None or any(v is not None for v in overrides.values())
+    atk_over = {"VID": args.vid, "PID": args.pid, "SN": args.sn}
+    changing = (args.mode is not None or args.man is not None or args.prod is not None
+                or any(v is not None for v in atk_over.values()))
     if not changing:
         b.close()
         print("profile : %s" % args.name)
         print("class   : %s" % (" ".join(modes) if modes else "(none)"))
-        for k in OVERRIDE_KEYS:
-            print("%-7s : %s" % (k, ov.get(k, "(default)")))
+        print("VID     : %s" % ov.get("VID", "(default)"))
+        print("PID     : %s" % ov.get("PID", "(default)"))
+        print("SN      : %s" % ov.get("SN", "(default)"))
+        print("MAN     : %s  (env)" % (cur_man  or "(default)"))
+        print("PROD    : %s  (env)" % (cur_prod or "(default)"))
         return
 
+    # ATTACKMODE-line edits (class + VID/PID/SN)
     if args.mode is not None:
         modes = args.mode.split()
-    for k, v in overrides.items():
+    for k, v in atk_over.items():
         if v is not None:
             ov[k] = v
-    old_line = lines[idx]
-    new_line = _build_attackmode(indent, modes, ov)
-    lines[idx] = new_line
+    old_atk = lines[idx]
+    new_atk = _build_attackmode(indent, modes, ov)
+    lines[idx] = new_atk
+
+    # env edits (MAN/PROD) - upsert export line before ATTACKMODE
+    env_targets = {}
+    if args.man is not None:
+        env_targets["BUNNY_IMANUFACTURER"] = args.man
+    if args.prod is not None:
+        env_targets["BUNNY_IPRODUCT"] = args.prod
+    for var, val in env_targets.items():
+        newline = 'export %s="%s"' % (var, val)
+        for i, l in enumerate(lines):
+            if re.match(r'\s*export\s+%s=' % var, l):
+                lines[i] = newline
+                break
+        else:
+            aidx = next((i for i, l in enumerate(lines) if l.strip().startswith("ATTACKMODE")), len(lines))
+            lines.insert(aidx, newline)
+
     new_text = "\n".join(lines) + "\n"
-    b64 = base64.b64encode(new_text.encode()).decode()
-    b.run("printf '%%s' '%s' | base64 -d > %s" % (b64, path))
-    b.run("chmod +x %s" % path)
+    b.put_file(path, new_text.encode(), make_exec=True)
+    b.run("sync")
     b.close()
     print("profile : %s" % args.name)
-    print("- %s" % old_line.strip())
-    print("+ %s" % new_line.strip())
+    if new_atk != old_atk:
+        print("- %s" % old_atk.strip())
+        print("+ %s" % new_atk.strip())
+    for var, val in env_targets.items():
+        print('+ export %s="%s"' % (var, val))
     print("(flip to the matching switch and replug to use it)")
 
 
@@ -546,6 +630,12 @@ def main():
     ppush.add_argument("name", help="profile name (without .sh)")
     ppush.add_argument("file", nargs="?", help="local .sh file to push (default: stdin)")
 
+    ppush2 = sub.add_parser("push", parents=[common],
+                            help="push any local file to an absolute device path (chunked)")
+    ppush2.add_argument("file", help="local file to push")
+    ppush2.add_argument("dest", help="absolute destination path on device")
+    ppush2.add_argument("--chmod", action="store_true", help="chmod +x the pushed file")
+
     pids = sub.add_parser("ids", parents=[common],
                           help="view/edit ATTACKMODE identifiers of a profile")
     pids.add_argument("name", help="profile name (without .sh)")
@@ -571,6 +661,7 @@ def main():
         "profiles":     cmd_profiles,
         "profile":      cmd_profile,
         "profile-push": cmd_profile_push,
+        "push":         cmd_push,
         "ids":          cmd_ids,
     }
     dispatch[a.cmd](a)
