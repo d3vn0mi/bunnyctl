@@ -223,6 +223,41 @@ python3 bunnyctl.py ids usb_sandisk          # show current: VID/PID/SN + MAN/PR
 
 ---
 
+## Changing the volume label (the Finder "BashBunny" name)
+
+Finder (and `diskutil`) show the udisk's **FAT volume label** — `BashBunny` by
+default. This is **separate from the USB descriptors**: the device can identify as
+a SanDisk Cruzer Blade yet still mount a volume labelled `BashBunny`, which is a
+dead giveaway to anyone who looks at the drive in a file manager.
+
+**From the Mac** (volume mounted, in any STORAGE mode):
+
+```sh
+diskutil rename /Volumes/BashBunny CRUZER
+```
+
+FAT labels are **≤11 characters, uppercase**. `CRUZER` is what a real Cruzer
+Blade typically shows (many ship blank). Contents are untouched. Replug and
+re-check with `diskutil list external physical` to confirm it stuck, and
+`ioreg … | grep -iA5 -e SanDisk` to confirm the descriptors are unaffected.
+
+**Device-side** (arming mode, over serial) — relabel the udisk FAT directly:
+
+```sh
+mount | grep udisk                 # find the block device
+dosfslabel <device> CRUZER         # or: fatlabel <device> CRUZER
+```
+
+**Caveat — this is global.** The udisk is a single partition, so the new label
+shows in **every** storage mode, including **arming** — you lose the obvious
+`BashBunny` marker when managing the device. And relabeling does nothing about the
+bigger tell: anyone who opens the volume still sees `payloads/`, `tools/`,
+`profiles/`. The clean fix for a convincing decoy is a **separate storage image**
+(see `ROADMAP.md`): its own label *and* innocuous contents, while your working
+udisk keeps `BashBunny`.
+
+---
+
 ## Host-side verification cheatsheet
 
 Confirm what the Bunny actually enumerated as, from the machine you plugged it
