@@ -223,6 +223,70 @@ python3 bunnyctl.py ids usb_sandisk          # show current: VID/PID/SN + MAN/PR
 
 ---
 
+## Host-side verification cheatsheet
+
+Confirm what the Bunny actually enumerated as, from the machine you plugged it
+into. Examples use the SanDisk spoof (`VID 0x0781`, `PID 0x5567`, serial
+`4C530112050213104539`); swap in your own IDs. There's no serial console in a
+STORAGE-only or HID-only profile, so these host tools are the only way to check.
+
+### macOS
+
+| Goal | Command |
+|------|---------|
+| Full USB tree | `system_profiler SPUSBDataType` |
+| Just the spoofed device | `system_profiler SPUSBDataType \| grep -iA10 -e sandisk -e cruzer` |
+| Descriptor fields only | `ioreg -p IOUSB -l -w0 \| grep -iE 'idVendor\|idProduct\|USB Serial Number\|USB Product Name\|USB Vendor Name'` |
+| Device + context | `ioreg -p IOUSB -l -w0 \| grep -iA5 -e SanDisk -e Cruzer` |
+| Storage volume present | `diskutil list external physical` |
+
+> macOS `ioreg` prints VID/PID in **decimal**: `idVendor 1921` = `0x0781`,
+> `idProduct 21863` = `0x5567`. Convert: `printf '0x%04x\n' 1921`.
+> `system_profiler` shows them in hex directly.
+> Descriptor strings are cached per `(VID,PID)`/port — if a value looks stale
+> after a change, replug into a **different port**.
+
+### Linux
+
+| Goal | Command |
+|------|---------|
+| One-line list | `lsusb` |
+| Full descriptors for a VID:PID | `lsusb -v -d 0781:5567` |
+| Key string descriptors | `lsusb -v -d 0781:5567 \| grep -iE 'idVendor\|idProduct\|iManufacturer\|iProduct\|iSerial'` |
+| Enumeration log (live) | `dmesg -w` (plug in, watch) or `dmesg \| tail -20` |
+| Sysfs attributes | `for f in idVendor idProduct manufacturer product serial; do echo "$f=$(cat /sys/bus/usb/devices/*/$f 2>/dev/null \| tr '\n' ' ')"; done` |
+| Storage node + attrs | `lsblk -o NAME,VENDOR,MODEL,SERIAL,SIZE` then `udevadm info -q all -n /dev/sdX` |
+
+### Windows (PowerShell)
+
+| Goal | Command |
+|------|---------|
+| Find by VID/PID | `Get-PnpDevice -PresentOnly \| ? InstanceId -match 'VID_0781&PID_5567'` |
+| Descriptor properties | `Get-PnpDeviceProperty -InstanceId (Get-PnpDevice -PresentOnly \| ? InstanceId -match 'VID_0781&PID_5567').InstanceId \| ft KeyName,Data -Auto` |
+| USB disks | `Get-Disk \| ? BusType -eq 'USB' \| ft Number,FriendlyName,SerialNumber,Size` |
+| Serial via WMI | `Get-WmiObject Win32_DiskDrive \| ? InterfaceType -eq 'USB' \| ft Model,SerialNumber` |
+| Registry (strings) | `reg query "HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_0781&PID_5567" /s` |
+
+> Windows caches USB descriptors hard. If a changed string doesn't show, remove
+> the device under Device Manager (View → show hidden devices) or clear stale
+> `USB\VID_*&PID_*` keys, then replug.
+
+### What a correct SanDisk spoof looks like
+
+| Field | Expected |
+|-------|----------|
+| idVendor | `0x0781` (SanDisk) |
+| idProduct | `0x5567` (Cruzer Blade) |
+| Manufacturer | `SanDisk` (exact case — needs the ATTACKMODE env patch) |
+| Product | `Cruzer Blade` (space intact — needs the env patch) |
+| Serial | `4C530112050213104539` |
+| Volume | a ~1.9 GB removable disk |
+
+If manufacturer shows `SANDISK` or product shows `HP Skylab USB Keyboard`, the
+env patch isn't applied — see **Changing USB identifiers**.
+
+---
+
 ## `bunnyctl.py` (host) command reference
 
 Options go **after** the subcommand. Port autodetects `/dev/cu.usbmodem*`
