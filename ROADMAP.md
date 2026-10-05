@@ -12,6 +12,7 @@ Open items and ideas, roughly in priority order.
   (FAT, innocuous label, a few plausible filler files) and point the storage
   function at it via the module's `file=` param instead of the udisk. This is
   the last real gap for a believable drive / SW2 decoy.
+  Process documented in `separate-clean-storage-image.md`.
   _Decision needed from Iason: build this?_
 
 - **Relabel quick-win.** Independent of the clean-image work: set the udisk FAT
