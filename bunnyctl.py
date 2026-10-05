@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bunnyctl v0.7 - Hak5 Bash Bunny serial control & audit
+bunnyctl v0.8 - Hak5 Bash Bunny serial control & audit
 ======================================================
 Drives a Bash Bunny over its USB serial console (CDC-ACM) non-interactively:
 finds the port, wakes the line (DTR hangup toggle), logs in, and runs commands
@@ -60,10 +60,14 @@ CHANGELOG
   v0.7  ids: MAN/PROD now driven via BUNNY_* env exports (stock ATTACKMODE has no
         PROD_ and uppercases MAN_); VID/PID/SN stay on the ATTACKMODE line.
         Requires the ATTACKMODE env patch (patch_attackmode.sh) on the device.
+  v0.8  reliability: disable tty echo + empty prompt after login so run() reads
+        clean output (ends the false "device reads ..." warnings from UART-
+        corrupted echo markers); mode/mode2 now sync the FAT after writing so the
+        dispatcher can't read a stale value (the intermittent "reapply" issue).
 """
 import sys, time, glob, random, argparse
 
-VERSION = "0.7"
+VERSION = "0.8"
 
 # mode.txt  -> SW1 (far end) active profile; switch1/payload.txt reads it at boot.
 # mode2.txt -> SW2 (middle)  active profile; switch2/payload.txt reads it at boot.
@@ -173,7 +177,18 @@ class Bunny:
     def ready(self):
         lit, typed = self._mark("RDY")
         self._send("echo " + typed)
-        return lit.encode() in self._read_until(lit, 5)
+        ok = lit.encode() in self._read_until(lit, 5)
+        if ok:
+            # Silence command echo + prompt so run() reads clean output. Without
+            # this, run() must strip the echoed command by matching its marker,
+            # which UART noise corrupts -> false "device reads ..." warnings.
+            self._send("stty -echo 2>/dev/null; export PS1='' PS2=''")
+            self._read_until(None, 1.0)
+            try:
+                self.ser.reset_input_buffer()
+            except Exception:
+                pass
+        return ok
 
     def run(self, cmd, timeout=None):
         lit, typed = self._mark()
@@ -322,12 +337,13 @@ def _mode_io(args, path, bank_label, switch_hint):
         print("%s profile: %s" % (bank_label, cur if cur else "(empty -> default)"))
         return
     b.run("printf '%%s\\n' '%s' > %s" % (value, path))
+    b.run("sync")                       # flush FAT so the dispatcher can't read a stale value
     back = b.run("cat %s 2>/dev/null" % path).strip()
     b.close()
     if back == value:
         print("%s profile set -> %s   (flip to %s and replug to use it)" % (bank_label, back, switch_hint))
     else:
-        print("WARNING: wrote '%s' but device reads '%s'" % (value, back))
+        print("WARNING: wrote '%s' but device reads '%s' - retry the command" % (value, back))
 
 
 def cmd_mode(args):
