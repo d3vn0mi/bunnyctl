@@ -62,13 +62,14 @@ boot if it's missing (idempotent; the `-x` test short-circuits thereafter).
 
 ---
 
-## The three red-team scenarios
+## Red-team scenarios
 
-| # | Goal                                          | Profile        | `ATTACKMODE` line                                                              |
-|---|-----------------------------------------------|----------------|-------------------------------------------------------------------------------|
-| 1 | Appear as a **keyboard**, run **payload #1**  | `kbd1`         | `ATTACKMODE HID` + QUACK sequence                                             |
-| 2 | Appear as **mass storage** with a spoofed ID  | `usb_sandisk`  | `ATTACKMODE STORAGE VID_0x0781 PID_0x5567 MAN_"SanDisk" PROD_"Cruzer Blade"`  |
-| 3 | Appear as a **keyboard**, run **payload #2**  | `kbd2`         | `ATTACKMODE HID` + QUACK sequence                                             |
+| # | Goal                                                 | Profile              | `ATTACKMODE` line                                                             |
+|---|------------------------------------------------------|----------------------|-------------------------------------------------------------------------------|
+| 1 | Appear as a **keyboard**, run **payload #1**         | `kbd1`               | `ATTACKMODE HID` + QUACK sequence                                             |
+| 2 | Appear as **mass storage** with a spoofed ID         | `usb_sandisk`        | `ATTACKMODE STORAGE VID_0x0781 PID_0x5567 MAN_"SanDisk" PROD_"Cruzer Blade"` |
+| 3 | Appear as a **keyboard**, run **payload #2**         | `kbd2`               | `ATTACKMODE HID` + QUACK sequence                                             |
+| 4 | **Deliver a file** to the target — keyboard-only     | `<name>` (generated) | `ATTACKMODE HID` + generated QUACK (base64 heredoc + sha1sum verify)          |
 
 Assign a profile to a bank, then flip to that switch and replug into the target:
 
@@ -144,6 +145,76 @@ python3 bunnyctl.py profile-push kbd1 kbd1.sh # push
 > **Timing matters.** A fresh HID enumeration on the target isn't instant. Lead
 > with `QUACK DELAY 1500`–`3000` or the first keystrokes are dropped. Locked-down
 > or slow VDI targets may need more.
+
+---
+
+## Delivering files via keyboard (type-file)
+
+Scenario 4 in full. One command generates a profile that types a file onto the
+target as a base64 heredoc, then decodes and sha1-verifies it — no USB storage,
+no network, no separate transfer tool. Works even when USB mass storage is
+blocked or suspicious.
+
+### Quick start
+
+**Step 1 — patch QUACK on-device (once per device, needs serial):**
+
+```sh
+python3 bunnyctl.py patch-quack
+```
+
+This injects per-character sleep support into the Bunny's QUACK interpreter so
+`BUNNY_CHAR_DELAY` is honoured. Idempotent; re-run after a firmware upgrade.
+Verify: `python3 bunnyctl.py exec 'grep -c BUNNY_CHAR_DELAY /usr/local/bunny/bin/QUACK'`
+(expect `3`).
+
+**Step 2 — generate the profile:**
+
+```sh
+python3 bunnyctl.py type-file /path/to/payload.bin deliver_payload
+```
+
+Pushes two files to the device:
+- `profiles/deliver_payload.sh` — profile (HID, BUNNY_CHAR_DELAY, QUACK path)
+- `profiles/deliver_payload.ducky` — Ducky Script (DEFAULT_DELAY, heredoc chunks, sha1sum)
+
+**Step 3 — optionally tune speed:**
+
+```sh
+python3 bunnyctl.py speed deliver_payload        # read (default 5 ms)
+python3 bunnyctl.py speed deliver_payload 8      # slow down to 8 ms/char
+python3 bunnyctl.py speed deliver_payload 3      # speed up to 3 ms/char
+```
+
+**Step 4 — assign to a bank and deliver:**
+
+```sh
+python3 bunnyctl.py mode  deliver_payload   # SW1
+python3 bunnyctl.py mode2 deliver_payload   # SW2
+```
+
+Flip the switch, plug into the target. The Bunny types the file out character by
+character. The target runs `base64 -d` and `sha1sum -c -`; both results print
+to the shell so you can verify from any screen-share or camera angle.
+
+### What lands on the target
+
+The decoded file is at `/tmp/<original_filename>` (override with `--out`).
+The b64 scratch file `/tmp/<filename>.b64` is removed automatically at the end.
+
+### Options
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--speed <ms>` | `5` | ms between typed characters (`BUNNY_CHAR_DELAY`) |
+| `--delay <ms>` | `200` | `DEFAULT_DELAY` between Ducky commands |
+| `--width <n>` | `76` | base64 line width — keep ≤ 180 (`MAX_CANON` limit) |
+| `--out <path>` | `/tmp/<fname>` | where the decoded file lands on the target |
+
+### Changing the delivered file
+
+Just re-run `type-file` with the new local path — the profile and ducky script
+are fully regenerated and pushed. No editing, no tmp-dir prep required.
 
 ---
 
@@ -343,6 +414,9 @@ Options go **after** the subcommand. Port autodetects `/dev/cu.usbmodem*`
 | `profile <name>`                     | print a profile script from device                   |
 | `profile-push <name> <file>`         | push a local `.sh` as a named profile                |
 | `ids <name> [--vid --pid --sn --mode --man --prod]` | view / edit a profile's identifiers |
+| `patch-quack`                               | patch QUACK on-device to honour `BUNNY_CHAR_DELAY` (idempotent) |
+| `speed <name> [ms]`                         | get / set `BUNNY_CHAR_DELAY` (ms) in a profile; omit ms to read |
+| `type-file <file> <name> [--speed --delay --width --out]` | generate + push keyboard file-delivery profile |
 
 `ids` with no flags prints class + VID/PID/SN (from the `ATTACKMODE` line) and
 MAN/PROD (from `BUNNY_*` env exports). With flags: `--vid/--pid/--sn/--mode` edit
@@ -457,6 +531,17 @@ payload. Confirm with `bunnyctl.py status` before unplugging.
 The target hadn't finished enumerating the HID before the profile started
 typing. Increase the leading `QUACK DELAY` (2000–3000 ms; more for VDI/locked
 endpoints).
+
+### Characters dropped in the middle of a string (type-file)
+QUACK types characters with zero inter-character delay by default — fast targets
+or high CPU load on the Bunny cause HID misses mid-string.
+
+1. Apply the QUACK patch if you haven't: `python3 bunnyctl.py patch-quack`
+2. Increase the per-character delay: `python3 bunnyctl.py speed <profile> 8`
+   (8 ms is a safe starting point; go up in steps of 2–3 until clean).
+3. Verify the patch is live: `python3 bunnyctl.py exec 'grep -c BUNNY_CHAR_DELAY /usr/local/bunny/bin/QUACK'` → should print `3`.
+4. Rebuild the profile with the new speed (`type-file … --speed 8`) or just
+   use `speed` — both methods write `BUNNY_CHAR_DELAY` into the profile.
 
 ### Storage/keyboard spoof: device doesn't enumerate at all (nothing appears)
 The gadget `insmod` failed, so no USB device comes up. On this firmware the
