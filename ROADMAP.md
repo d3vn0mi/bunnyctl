@@ -15,6 +15,8 @@ Open items and ideas, roughly in priority order.
   Process documented in `separate-clean-storage-image.md`.
   _Decision needed from Iason: build this?_
 
+## In progress / next
+
 - **Relabel quick-win.** Independent of the clean-image work: set the udisk FAT
   volume label to something neutral so `diskutil` / Explorer don't show
   `BashBunny`.
@@ -38,3 +40,8 @@ Open items and ideas, roughly in priority order.
 - v0.6 chunked base64 push (fixes tty MAX_CANON mangling); `push` command
 - v0.7 `ids` MAN/PROD via `BUNNY_*` env; ATTACKMODE env patch for iProduct/
   iManufacturer with correct kernel-level quoting (case + spaces preserved)
+- v0.8 serial reliability (echo off, prompt suppressed); `sync` after mode writes
+- v0.9 `patch-quack` — idempotent QUACK patch for `BUNNY_CHAR_DELAY` per-character
+  sleep (fixes dropped HID characters at speed); `speed` — per-profile delay
+  setter; `type-file` — local file → keyboard-delivery profile generator
+  (base64 heredoc + sha1sum verify, one command, no manual profile editing)

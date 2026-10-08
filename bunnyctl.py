@@ -33,6 +33,13 @@ Usage (options go AFTER the subcommand):
   bunnyctl.py ids usb_sandisk --sn "1234ABCD"
       (VID/PID/SN edit the ATTACKMODE line; MAN/PROD edit BUNNY_* env exports -
        needs patch_attackmode.sh applied on the device)
+  --- keyboard typing speed ---
+  bunnyctl.py patch-quack                     patch QUACK on-device: add BUNNY_CHAR_DELAY support
+  bunnyctl.py speed kbd1                      show current char delay for profile
+  bunnyctl.py speed kbd1 5                    set char delay to 5 ms (0 = disabled)
+  --- file delivery via keyboard ---
+  bunnyctl.py type-file secret.bin sw1_deliver          generate + push a file-typing profile
+  bunnyctl.py type-file payload.bin sw2_deliver --width 60 --speed 8 --out /tmp/p.bin
 
 Common options: --port --baud --user --password --timeout --no-wake
 Port autodetects /dev/cu.usbmodem* (macOS) or /dev/ttyACM* (Linux) when --port omitted.
@@ -64,10 +71,15 @@ CHANGELOG
         clean output (ends the false "device reads ..." warnings from UART-
         corrupted echo markers); mode/mode2 now sync the FAT after writing so the
         dispatcher can't read a stale value (the intermittent "reapply" issue).
+  v0.9  patch-quack: idempotent patch for on-device QUACK interpreter to read
+        BUNNY_CHAR_DELAY env and sleep between HID keystrokes — fixes dropped
+        characters at high typing speed. speed: per-profile char-delay setting.
+        type-file: generate + push a complete keyboard file-delivery profile
+        (base64 heredoc + sha1sum verify) from a local file in one command.
 """
 import sys, time, glob, random, argparse
 
-VERSION = "0.8"
+VERSION = "0.9"
 
 # mode.txt  -> SW1 (far end) active profile; switch1/payload.txt reads it at boot.
 # mode2.txt -> SW2 (middle)  active profile; switch2/payload.txt reads it at boot.
@@ -599,6 +611,216 @@ def cmd_ids(args):
     print("(flip to the matching switch and replug to use it)")
 
 
+# ---- QUACK char-delay patch (v0.9) ------------------------------------------
+# Embedded shell script pushed to the device by 'patch-quack'. Idempotent:
+# backs up /usr/local/bunny/bin/QUACK to QUACK.orig, then patches the STRING
+# command loop to honour the BUNNY_CHAR_DELAY env var (ms per keystroke).
+
+QUACK_PATCH = r"""#!/bin/sh
+# patch_quack.sh - inject BUNNY_CHAR_DELAY per-character HID delay into QUACK
+# Idempotent: backs up QUACK to QUACK.orig; always rebuilds patched copy from it.
+QUACK=/usr/local/bunny/bin/QUACK
+ORIG="${QUACK}.orig"
+[ -f "$QUACK" ] || { echo "ERROR: $QUACK not found"; exit 1; }
+[ -f "$ORIG" ] || { cp "$QUACK" "$ORIG" && echo "saved original -> $ORIG"; }
+if grep -q BUNNY_CHAR_DELAY "$QUACK"; then
+    echo "already patched"
+    exit 0
+fi
+python2 - "$ORIG" "$QUACK" <<'__PY__'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    text = f.read()
+if 'import os' not in text:
+    text = 'import os\n' + text
+lines = text.split('\n')
+out, done, in_s = [], False, False
+for line in lines:
+    out.append(line)
+    if "cmd == 'STRING'" in line:
+        in_s = True
+    if in_s and 'hidg_write(elements)' in line and not done:
+        p = ' ' * (len(line) - len(line.lstrip()))
+        out.append(p + "_d = int(os.environ.get('BUNNY_CHAR_DELAY', '0') or '0')")
+        out.append(p + "if _d > 0:")
+        out.append(p + "    time.sleep(_d * 0.001)")
+        done = True
+if not done:
+    sys.stderr.write('patch_quack ERROR: STRING/hidg_write block not found in QUACK\n')
+    sys.exit(1)
+with open(dst, 'w') as f:
+    f.write('\n'.join(out))
+print('patch applied ok')
+__PY__
+[ $? -eq 0 ] || { echo "python2 patch step failed"; exit 1; }
+chmod +x "$QUACK"
+echo "QUACK char-delay patch applied successfully"
+"""
+
+
+def cmd_patch_quack(args):
+    """Push and apply the QUACK char-delay patch on the device.
+    Backs up /usr/local/bunny/bin/QUACK to QUACK.orig (idempotent) and injects
+    a BUNNY_CHAR_DELAY env read + time.sleep() after each hidg_write() in the
+    STRING command loop.  Set export BUNNY_CHAR_DELAY=<ms> in any profile to
+    activate per-character sleep; 0 or unset = no delay (original behaviour)."""
+    b, port = connect(args); _ready_or_die(b, port)
+    tmp = "/tmp/patch_quack.sh"
+    b.put_file(tmp, QUACK_PATCH.encode(), make_exec=True)
+    out = b.run("sh %s; rm -f %s" % (tmp, tmp), timeout=30)
+    b.close()
+    print(out)
+    if "applied" in out or "already patched" in out:
+        print()
+        print("Use 'bunnyctl speed <profile> <ms>' to set char delay in a profile (e.g. 5 ms).")
+        print("Use 'bunnyctl speed <profile>'      to read the current setting.")
+
+
+def cmd_speed(args):
+    """Get/set BUNNY_CHAR_DELAY (per-keystroke sleep, ms) in a profile.
+    Reads or upserts the 'export BUNNY_CHAR_DELAY=<ms>' line in the profile
+    script.  Requires the QUACK patch on-device (run 'bunnyctl patch-quack')."""
+    import re
+    b, port = connect(args); _ready_or_die(b, port)
+    path = "%s/%s.sh" % (PROFILES_PATH, args.name)
+    text = b.run("cat %s 2>/dev/null || echo __NOT_FOUND__" % path)
+    if "__NOT_FOUND__" in text:
+        b.close(); sys.exit("profile not found: %s   (run: bunnyctl profiles)" % args.name)
+    lines = text.splitlines()
+    ms = args.ms
+
+    if ms is None:
+        b.close()
+        cur = None
+        for l in lines:
+            m = re.match(r'\s*export\s+BUNNY_CHAR_DELAY=(\S+)', l)
+            if m:
+                cur = m.group(1); break
+        if cur:
+            print("profile '%s'  BUNNY_CHAR_DELAY = %s ms" % (args.name, cur))
+        else:
+            print("profile '%s'  BUNNY_CHAR_DELAY = not set (0 ms / disabled)" % args.name)
+        return
+
+    newline = "export BUNNY_CHAR_DELAY=%s" % ms
+    found = False
+    for i, l in enumerate(lines):
+        if re.match(r'\s*export\s+BUNNY_CHAR_DELAY=', l):
+            lines[i] = newline; found = True; break
+    if not found:
+        aidx = next((i for i, l in enumerate(lines) if l.strip().startswith("ATTACKMODE")), 0)
+        lines.insert(aidx, newline)
+
+    new_text = "\n".join(lines) + "\n"
+    b.put_file(path, new_text.encode(), make_exec=True)
+    b.run("sync")
+    b.close()
+    print("profile '%s'  BUNNY_CHAR_DELAY -> %s ms" % (args.name, ms))
+    if ms == "0":
+        print("(0 ms = no per-character delay; patch still present but inactive)")
+
+
+def cmd_type_file(args):
+    """Generate and push a keyboard file-delivery profile from a local file.
+    Creates on the device:
+      profiles/<name>.ducky  - Ducky Script: heredoc, base64 chunks+ENTER, decode, sha1sum
+      profiles/<name>.sh     - shell profile (BUNNY_CHAR_DELAY, ATTACKMODE HID, QUACK)
+    When loaded and flipped, the Bunny types the file to whatever terminal is
+    open on the target.  Run 'bunnyctl patch-quack' first if not done."""
+    import base64, hashlib
+    import os as _os
+
+    b64_width  = args.width   # b64 chars per typed line
+    char_delay = args.speed   # ms written to BUNNY_CHAR_DELAY in profile
+    cmd_delay  = args.delay   # Ducky DEFAULT_DELAY between commands (ms)
+
+    try:
+        with open(args.file, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        sys.exit("cannot read %s: %r" % (args.file, e))
+
+    b64    = base64.b64encode(data).decode()
+    sha1   = hashlib.sha1(data).hexdigest()
+    fname  = _os.path.basename(args.file)
+    remote_out = args.out if args.out else "/tmp/%s" % fname
+    b64_tmp    = remote_out + ".b64"
+    chunks     = [b64[i:i+b64_width] for i in range(0, len(b64), b64_width)]
+
+    # ---- Ducky Script --------------------------------------------------------
+    dk = []
+    dk.append("REM bunnyctl type-file: %s -> %s" % (fname, remote_out))
+    dk.append("REM size=%d  sha1=%s" % (len(data), sha1))
+    dk.append("REM chunks=%d  width=%d  char_delay=%d ms" % (len(chunks), b64_width, char_delay))
+    dk.append("")
+    dk.append("DEFAULT_DELAY %d" % cmd_delay)
+    dk.append("DELAY 1000")
+    dk.append("")
+    dk.append("REM open heredoc on target shell")
+    dk.append("STRING cat << 'BCTL_EOF' > %s" % b64_tmp)
+    dk.append("ENTER")
+    dk.append("")
+    dk.append("REM base64 payload (%d chunks x %d chars)" % (len(chunks), b64_width))
+    for chunk in chunks:
+        dk.append("STRING %s" % chunk)
+        dk.append("ENTER")
+    dk.append("")
+    dk.append("REM close heredoc + decode")
+    dk.append("STRING BCTL_EOF")
+    dk.append("ENTER")
+    dk.append("DELAY 500")
+    dk.append("STRING base64 -d %s > %s" % (b64_tmp, remote_out))
+    dk.append("ENTER")
+    dk.append("DELAY 500")
+    dk.append("REM verify integrity")
+    dk.append("STRING echo '%s  %s' | sha1sum -c -" % (sha1, remote_out))
+    dk.append("ENTER")
+    dk.append("DELAY 300")
+    dk.append("STRING rm -f %s" % b64_tmp)
+    dk.append("ENTER")
+    ducky_text = "\n".join(dk) + "\n"
+
+    # ---- Profile shell script ------------------------------------------------
+    ducky_path = "%s/%s.ducky" % (PROFILES_PATH, args.name)
+    sh_lines = [
+        "#!/bin/sh",
+        "# bunnyctl type-file profile: %s" % args.name,
+        "# delivers: %s (%d bytes, sha1=%s)" % (fname, len(data), sha1),
+        "export BUNNY_CHAR_DELAY=%d" % char_delay,
+        "ATTACKMODE HID",
+        "LED ATTACK",
+        "QUACK %s" % ducky_path,
+        "LED FINISH",
+    ]
+    sh_text = "\n".join(sh_lines) + "\n"
+
+    # ---- Push to device ------------------------------------------------------
+    b, port = connect(args); _ready_or_die(b, port)
+    b.run("mkdir -p %s" % PROFILES_PATH)
+
+    print("pushing ducky script (%d chunks) ..." % len(chunks))
+    sz_dk = b.put_file(ducky_path, ducky_text.encode(), make_exec=False)
+
+    sh_path = "%s/%s.sh" % (PROFILES_PATH, args.name)
+    print("pushing profile ...")
+    sz_sh = b.put_file(sh_path, sh_text.encode(), make_exec=True)
+    b.run("sync")
+    b.close()
+
+    print()
+    print("profile  : %s" % args.name)
+    print("ducky    : %s  (%s bytes on device)" % (ducky_path, sz_dk))
+    print("script   : %s  (%s bytes on device)" % (sh_path, sz_sh))
+    print("delivers : %s  (%d bytes)" % (fname, len(data)))
+    print("sha1     : %s" % sha1)
+    print("chunks   : %d x %d chars  char_delay=%d ms" % (len(chunks), b64_width, char_delay))
+    print()
+    print("Load:   bunnyctl mode <name>   OR   bunnyctl mode2 <name>" )
+    print("        then flip switch and replug into target (target needs open terminal)")
+    print("Verify: echo '%s  %s' | sha1sum -c -" % (sha1, remote_out))
+
+
 # ---- arg parser + dispatch ---------------------------------------------------
 
 def main():
@@ -662,6 +884,27 @@ def main():
     pids.add_argument("--sn",   help="iSerial string")
     pids.add_argument("--mode", help="class token(s), e.g. 'HID' or 'HID STORAGE'")
 
+    sub.add_parser("patch-quack", parents=[common],
+                   help="patch QUACK on-device to honour BUNNY_CHAR_DELAY (idempotent)")
+
+    pspd = sub.add_parser("speed", parents=[common],
+                          help="get/set BUNNY_CHAR_DELAY (ms/char) for a profile")
+    pspd.add_argument("name", help="profile name (without .sh)")
+    pspd.add_argument("ms",   nargs="?",
+                      help="delay in ms (0 = disabled); omit to read current value")
+
+    ptf = sub.add_parser("type-file", parents=[common],
+                         help="generate + push a keyboard file-delivery profile")
+    ptf.add_argument("file", help="local file to deliver via keyboard typing")
+    ptf.add_argument("name", help="profile name (without .sh)")
+    ptf.add_argument("--width", type=int, default=76,
+                     help="base64 chars per typed line (default 76; smaller = more visual checkpoints)")
+    ptf.add_argument("--speed", type=int, default=5,
+                     help="per-char delay ms written to BUNNY_CHAR_DELAY (default 5; 0 = off)")
+    ptf.add_argument("--delay", type=int, default=200,
+                     help="Ducky DEFAULT_DELAY between commands in ms (default 200)")
+    ptf.add_argument("--out",   help="destination path on target (default /tmp/<filename>)")
+
     a = p.parse_args()
     dispatch = {
         "probe":        cmd_probe,
@@ -679,6 +922,9 @@ def main():
         "profile-push": cmd_profile_push,
         "push":         cmd_push,
         "ids":          cmd_ids,
+        "patch-quack":  cmd_patch_quack,
+        "speed":        cmd_speed,
+        "type-file":    cmd_type_file,
     }
     dispatch[a.cmd](a)
 
